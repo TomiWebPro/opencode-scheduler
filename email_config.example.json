@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_user": "you@gmail.com",
+  "smtp_password": "xxxx xxxx xxxx xxxx",
+  "notify_to": "you@gmail.com",
+  "imap_host": "imap.gmail.com",
+  "mail_inbox": {
+    "enabled": true,
+    "poll_seconds": 120,
+    "allowed_senders": ["you@gmail.com"],
+    "subject": "sched",
+    "agent_timeout": 480,
+    "pending_expiry_hours": 24
+  }
+}

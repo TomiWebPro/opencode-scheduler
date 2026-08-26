@@ -1,0 +1,8 @@
+scheduler.db
+scheduler.db-shm
+scheduler.db-wal
+mail_inbox.db
+email_config.json
+*.log
+logs/
+__pycache__/
