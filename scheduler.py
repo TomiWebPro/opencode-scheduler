@@ -533,15 +533,24 @@ class Runner:
     def __init__(self, workers):
         self.workers = workers
         self.threads = []
+        self.submitted_at = {}  # job_id -> timestamp of last submit
 
     def busy(self):
         self.threads[:] = [t for t in self.threads if t.is_alive()]
         return len(self.threads)
 
     def submit(self, job_id):
+        self.submitted_at[job_id] = time.time()
+        # prune entries older than 10 min
+        cutoff = time.time() - 600
+        for jid in [j for j, ts in self.submitted_at.items() if ts < cutoff]:
+            del self.submitted_at[jid]
         t = threading.Thread(target=execute_job, args=(job_id,), daemon=True)
         t.start()
         self.threads.append(t)
+
+    def just_submitted(self, job_id, window_s=120):
+        return time.time() - self.submitted_at.get(job_id, 0) < window_s
 
 
 def _run_final_status(run):
@@ -556,7 +565,7 @@ def _run_final_status(run):
     return "FAILED"
 
 
-def self_heal(conn, now):
+def self_heal(conn, now, just_submitted=None):
     """Repair run/job records stranded by daemon crashes or mid-run kills.
 
     - runs that logged a finish (finished_at set) but are still status='running'
@@ -595,6 +604,8 @@ def self_heal(conn, now):
     for j in conn.execute(
         "SELECT id, name, schedule, timeout_s FROM jobs WHERE status='running'"
     ).fetchall():
+        if just_submitted and just_submitted(j["id"]):
+            continue  # dispatched moments ago; worker thread still starting
         grace = (j["timeout_s"] or 600) + 180
         live = conn.execute(
             "SELECT 1 FROM runs WHERE job_id=? AND status='running' "
@@ -641,6 +652,12 @@ def daemon_loop(poll, workers):
         try:
             runner.threads[:] = [t for t in runner.threads if t.is_alive()]
             conn = db()
+            # heal FIRST so a job dispatched below is never reaped in the same
+            # iteration before its worker thread inserts the run row.
+            try:
+                self_heal(conn, time.time(), runner.just_submitted)
+            except Exception as e:
+                print(f"self-heal error: {e}", file=sys.stderr)
             due = conn.execute(
                 "SELECT id FROM jobs WHERE enabled=1 AND status='pending' AND next_run_at<=?",
                 (time.time(),),
@@ -664,11 +681,6 @@ def daemon_loop(poll, workers):
                 conn.commit()
                 if cur.rowcount:
                     runner.submit(row["id"])
-            # periodic self-heal: recover any run/job stranded since last loop
-            try:
-                self_heal(conn, time.time())
-            except Exception as e:
-                print(f"self-heal error: {e}", file=sys.stderr)
             conn.close()
         except Exception as e:
             print(f"loop error: {e}", file=sys.stderr)
