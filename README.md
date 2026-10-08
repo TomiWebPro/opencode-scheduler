@@ -31,6 +31,7 @@ After the task finishes, the scheduler may run up to two more opencode calls:
 | `mail_inbox.db` | IMAP cursor + request tracking |
 | `email_notifier.py` | Gmail SMTP sender |
 | `email_config.json` | SMTP/IMAP credentials (gitignore this) |
+| `use-local-llm.sh` | switch all `vs-*` jobs to a local endpoint (see Model selection) |
 | `logs/activity.jsonl` | machine-readable event log (every event, timestamped) |
 | `logs/journal.md` | human-readable timeline (`scheduler.py journal`) |
 | `logs/<name>-<ts>.log` | raw stdout/stderr of each run (+ `-check.log`, `-report.log`) |
@@ -40,6 +41,55 @@ After the task finishes, the scheduler may run up to two more opencode calls:
 - cron: `--schedule "*/30 * * * *"` (min hour dom mon dow)
 - interval: `--every 30m` / `2h` / `1d`
 - once: `--once` (runs once then disables itself)
+
+## Model selection
+
+Precedence for which model a run uses:
+
+1. **Per-job override** — the job's `model` column (set via `add --model ...`).
+   When set, `build_cmd()` appends `-m <model>` to the `opencode run` call.
+2. **Global OpenCode default** — otherwise `opencode run` falls back to the
+   `model` field in `~/.config/opencode/opencode.json`. On this machine that is
+   the **local** model `llamacpp/qwen3.8-27b` (llama.cpp server at
+   `http://100.67.81.44:8080/v1`), so **jobs with `model = NULL` already run
+   locally by default.**
+
+Current state (2026-10-08): all `vs-*` and `ss-*` jobs are **explicitly pinned**
+to `model='llamacpp/qwen3.8-27b'` in `scheduler.db` (not relying on the global
+default), after the cloud free tier started returning 429s. Verified with
+`opencode run "reply with exactly: PONG" -m llamacpp/qwen3.8-27b --format json`
+→ clean `PONG`. Note the Qwen3 model spends tokens "thinking" before answering,
+so agent runs are slower than on the cloud model — size `timeout_s` generously
+(ss-* are at 5400s).
+
+Quick queries (note: the `sqlite3` CLI may be missing — use python3):
+
+```bash
+# which model is each job pinned to?
+python3 -c "
+import sqlite3
+c = sqlite3.connect('scheduler.db')
+for r in c.execute('select id, name, model from jobs'): print(r)"
+
+# fall back all vs-* jobs to the (local) default
+python3 -c "
+import sqlite3
+c = sqlite3.connect('scheduler.db')
+c.execute(\"update jobs set model=null where name like 'vs-%'\"); c.commit()"
+
+# pin one job to a specific model (there is no in-place CLI for this)
+python3 -c "
+import sqlite3
+c = sqlite3.connect('scheduler.db')
+c.execute(\"update jobs set model='opencode/muse-spark-1.3-contributor-free' where name='vs-qa'\"); c.commit()"
+```
+
+`use-local-llm.sh <baseURL> <model>` is the original helper for switching all
+`vs-*` jobs to a local OpenAI-compatible endpoint; `./use-local-llm.sh "" ""`
+clears the overrides back to the global default. Known quirk: it writes the
+legacy `provider` (singular) key into `opencode.json`, while the current config
+uses `providers` (plural) — verify the provider block after running it with
+arguments.
 
 ## Usage
 
