@@ -9,7 +9,10 @@ journalled to logs/activity.jsonl.
 
 import argparse
 import json
+import os
 import re
+import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -209,43 +212,170 @@ def compute_next_run(job_row):
 
 # ---------------- opencode execution ----------------
 
-def build_cmd(prompt, job, title):
-    cmd = ["opencode", "run", prompt, "--title", title, "--format", "json"]
-    d = job["dir"]
-    if d and d != ".":
-        cmd += ["--dir", d]
-    if job["agent"]:
-        cmd += ["--agent", job["agent"]]
+def build_cmd(message, job, title):
+    # opencode run (v2.x) has NO --dir flag. The working directory is selected
+    # with a LEADING POSITIONAL:  `opencode run [flags] [<dir>] <message>`
+    #   - no dir   -> the single positional is the message
+    #   - with dir -> the first positional is the directory, the rest the message
+    # (Verified empirically: a lone positional is the message; with a directory
+    # the directory must come first. opencode otherwise defaults to $HOME and
+    # ignores the subprocess cwd.)
+    cmd = ["opencode", "run", "--title", title, "--format", "json"]
     if job["model"]:
         cmd += ["-m", job["model"]]
     if job["auto_approve"]:
         cmd += ["--auto"]
+    run_dir = job["dir"] if (job["dir"] and job["dir"] != ".") else None
+    if run_dir:
+        cmd.append(run_dir)
+    cmd.append(message)
     return cmd
 
 
+def compose_message(job):
+    """Build the final user message for a job's MAIN task.
+
+    Custom agents (`.opencode/agents/<name>.md`) are not reliably resolved by
+    name from a non-interactive daemon (the `Agent not found: "<name>"` failure
+    — name lookup depends on the interactive session's project context). So we
+    run the DEFAULT agent and have it read + follow the named agent's protocol
+    file, keeping that file the single source of truth.
+    """
+    prompt = job["prompt"]
+    agent = job["agent"]
+    if not agent:
+        return prompt
+    base = job["dir"] if (job["dir"] and job["dir"] != ".") else "."
+    agent_path = f"{base}/.opencode/agents/{agent}.md"
+    return (
+        f"You are operating as the '{agent}' agent for this run.\n"
+        f"FIRST read and follow the protocol in {agent_path} exactly.\n\n"
+        f"{prompt}"
+    )
+
+
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+SES_RE = re.compile(r"ses_[A-Za-z0-9]+")
 
 
-def run_opencode(cmd, log_path, timeout=None):
-    """Run opencode headlessly. Returns (exit_code, session_id|None, text_output)."""
+def opencode_exe():
+    """Path to the opencode CLI (used for server-side session control)."""
+    return shutil.which("opencode") or os.path.expanduser("~/.opencode/bin/opencode")
+
+
+def interrupt_session(session_id, timeout=30):
+    """Best-effort abort of a server-side agent session via `opencode api`.
+
+    Killing the `opencode run` client does NOT stop the agent: the session
+    keeps executing inside `opencode serve`. Returns True if the server
+    confirms it interrupted a live execution.
+    """
+    if not session_id:
+        return False
+    try:
+        p = subprocess.run(
+            [opencode_exe(), "api", "session.interrupt", "--param", f"sessionID={session_id}"],
+            capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            return False
+        try:
+            return bool(json.loads(p.stdout.strip()).get("interrupted"))
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def run_opencode(cmd, log_path, timeout=None, cwd=None):
+    """Run opencode headlessly. Returns (exit_code, session_id|None, text_output).
+
+    cwd: directory the opencode process is launched in. The directory opencode
+    actually operates in is selected by the leading directory positional that
+    build_cmd emits (opencode run has no --dir flag); cwd is passed too, for
+    consistency and config discovery.
+    """
     if timeout is None:
         timeout = 600  # default 10 min
     with open(log_path, "w") as logf:
         logf.write(f"$ {' '.join(cmd)}\n\n")
         logf.flush()
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=logf, text=True)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=logf, text=True, cwd=cwd,
+                                      start_new_session=True)
+            # Drain stdout on a reader thread so the live session ID is known
+            # BEFORE the run ends — it is needed to abort the server-side
+            # session on timeout (below). `communicate()` only yields output
+            # at the very end, which is too late for a run that must be killed.
+            chunks = []
+            live = {}
+
+            def _drain():
+                try:
+                    for line in iter(proc.stdout.readline, ""):
+                        chunks.append(line)
+                        if "sid" not in live:
+                            m = SES_RE.search(line)
+                            if m:
+                                live["sid"] = m.group(0)
+                except Exception:
+                    pass
+
+            drainer = threading.Thread(target=_drain, daemon=True)
+            drainer.start()
+            keep_partial = True
             try:
-                stdout, _ = proc.communicate(timeout=timeout)
+                proc.wait(timeout=timeout)
                 exit_code = proc.returncode
             except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, _ = proc.communicate()
+                # Kill the whole process GROUP (not just the wrapper): timed-out
+                # `opencode run` wrappers otherwise leave orphaned children with
+                # no DB run tracking them.
+                # CRITICAL: that only kills the CLIENT. The agent session keeps
+                # running server-side inside `opencode serve`, so abort it via
+                # the API too — otherwise the "timed out" job keeps working
+                # unsupervised for hours (observed 2026-10-11: timed-out runs
+                # still active 1-4h after their timeout).
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    pass
+                sid = live.get("sid")
+                if sid:
+                    ok = interrupt_session(sid)
+                    logf.write(f"\n[timeout] server-side session interrupt {sid}: {'ok' if ok else 'FAILED'}\n")
+                    logf.flush()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=10)
+                    except Exception:
+                        pass
                 exit_code = -1
             except Exception:
-                proc.kill()
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                if live.get("sid"):
+                    interrupt_session(live["sid"])
+                keep_partial = False
                 stdout = ""
                 exit_code = -2
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            drainer.join(timeout=10)
+            if keep_partial:
+                stdout = "".join(chunks)
         except Exception as e:
             # failed to start process
             stdout = ""
@@ -326,11 +456,12 @@ def generate_report(conn, job, run_row, ts):
         check_section=check_section,
     )
     fake_job = job  # same agent/model/dir settings
+    run_cwd = job["dir"] if (job["dir"] and job["dir"] != ".") else None
     log_path = str(LOG_DIR / f"{job['name']}-{ts}-report.log")
     report_timeout = max(job["timeout_s"], 120)  # at least 2 min for QA
     code, session_id, text = run_opencode(
         build_cmd(prompt, fake_job, f"{job['name']}-{ts}-report"), log_path,
-        timeout=report_timeout
+        timeout=report_timeout, cwd=run_cwd
     )
     score_m = SCORE_RE.search(text or "")
     verdict_m = VERDICT_RE.search(text or "")
@@ -377,10 +508,11 @@ def _execute_job_inner(conn, job_id):
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_event("run_start", job=job["name"], run=run_id)
 
+    run_cwd = job["dir"] if (job["dir"] and job["dir"] != ".") else None
     log_path = str(LOG_DIR / f"{job['name']}-{ts}.log")
     code, session_id, output = run_opencode(
-        build_cmd(job["prompt"], job, f"{job['name']}-{ts}"), log_path,
-        timeout=job["timeout_s"]
+        build_cmd(compose_message(job), job, f"{job['name']}-{ts}"), log_path,
+        timeout=job["timeout_s"], cwd=run_cwd
     )
     log_event("task_finished", job=job["name"], run=run_id, exit_code=code,
               session=session_id, duration_s=round(time.time() - started, 1))
@@ -401,7 +533,7 @@ def _execute_job_inner(conn, job_id):
         check_timeout = max(job["timeout_s"], 120)  # at least 2 min for verification
         _, check_session, check_output = run_opencode(
             build_cmd(full_prompt, job, f"{job['name']}-{ts}-check"), c_log,
-            timeout=check_timeout
+            timeout=check_timeout, cwd=run_cwd
         )
         m = CHECK_RE.search(check_output or "")
         check_passed = 1 if (m and m.group(1).upper() == "PASS") else 0
@@ -604,7 +736,7 @@ def self_heal(conn, now, just_submitted=None):
                 repairs.append(f"run#{r['id']} orphan->ABORTED")
     # 3. jobs stranded in 'running' with no live run -> reset
     for j in conn.execute(
-        "SELECT id, name, schedule, timeout_s FROM jobs WHERE status='running'"
+        "SELECT id, name, schedule, timeout_s FROM jobs WHERE status='running' AND name NOT LIKE 'calc-%'"
     ).fetchall():
         if just_submitted and just_submitted(j["id"]):
             continue  # dispatched moments ago; worker thread still starting
@@ -661,7 +793,8 @@ def daemon_loop(poll, workers):
             except Exception as e:
                 print(f"self-heal error: {e}", file=sys.stderr)
             due = conn.execute(
-                "SELECT id FROM jobs WHERE enabled=1 AND status='pending' AND next_run_at<=?",
+                "SELECT id FROM jobs WHERE enabled=1 AND status='pending' AND next_run_at<=?"
+                " AND name NOT LIKE 'calc-%'",
                 (time.time(),),
             ).fetchall()
             for row in due:
@@ -898,6 +1031,350 @@ def cmd_heal(args):
         print("nothing to repair; all run/job records are consistent")
 
 
+# ---------------- live agents / TUI ----------------
+
+TITLE_RE = re.compile(r"^(?P<job>.+)-(?P<ts>\d{8}-\d{6})(?P<phase>-check|-report)?$")
+
+
+def _iter_proc_cmdlines():
+    """Yield (pid, argv) for local processes. Linux /proc only, stdlib only."""
+    try:
+        names = os.listdir("/proc")
+    except FileNotFoundError:
+        return
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if not raw.strip(b"\x00"):
+            continue
+        argv = [p.decode("utf-8", "replace") for p in raw.rstrip(b"\x00").split(b"\x00")]
+        yield pid, argv
+
+
+def _proc_meta(pid):
+    """RSS / state / start-time for one pid. Returns {} on failure."""
+    meta = {}
+    try:
+        st = os.stat(f"/proc/{pid}")
+        meta["start_ts"] = st.st_mtime
+    except (FileNotFoundError, PermissionError):
+        return {}
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    meta["mem_kb"] = int(line.split()[1])
+                elif line.startswith("State:"):
+                    meta["state"] = line.split(":")[1].strip().split()[0]
+    except (FileNotFoundError, PermissionError, ValueError):
+        pass
+    return meta
+
+
+def _ps_enrich(pids):
+    """Best-effort ELAPSED/CPU/MEM via `ps`. Returns {pid: {...}}."""
+    out = {}
+    if not pids:
+        return out
+    try:
+        r = subprocess.run(
+            ["ps", "-o", "pid=,etime=,pcpu=,pmem=,args=", "-p", ",".join(map(str, pids))],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return out
+    if r.returncode != 0:
+        return out
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(None, 4)
+        if len(parts) < 5:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        out[pid] = {"etime": parts[1], "pcpu": parts[2], "pmem": parts[3]}
+    return out
+
+
+def _resolve_live_log(job_name, started_at):
+    """Running runs have log_path=NULL (written only at finish) — find the
+    live log file by name pattern instead."""
+    try:
+        cands = [p for p in LOG_DIR.glob(f"{job_name}-*.log")
+                 if not p.name.endswith(("-check.log", "-report.log"))]
+    except OSError:
+        return None
+    if not cands:
+        return None
+    if started_at:
+        # the run's own log started within seconds of started_at
+        cands.sort(key=lambda p: abs(p.stat().st_mtime - started_at))
+    else:
+        cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(cands[0])
+
+
+def _title_of(argv):
+    if "--title" in argv:
+        i = argv.index("--title")
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def live_agent_snapshot(now=None):
+    """Combine DB running-runs with live `opencode run` OS processes.
+
+    Returns a dict with daemon info, per-agent rows, orphans and counts.
+    """
+    now = now or time.time()
+    conn = db()
+    try:
+        jobs = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM jobs")}
+        running_runs = [
+            dict(r) for r in conn.execute(
+                """SELECT r.*, j.name AS job_name, j.dir AS job_dir, j.agent AS job_agent,
+                          j.model AS job_model, j.timeout_s AS job_timeout
+                   FROM runs r JOIN jobs j ON j.id=r.job_id
+                   WHERE r.status='running' AND r.finished_at IS NULL
+                   ORDER BY r.started_at"""
+            )
+        ]
+    finally:
+        conn.close()
+
+    # --- scan OS processes ---
+    opencode_procs = []  # (pid, argv, title, job_guess, phase, meta)
+    daemon = None
+    mail_procs = []
+    for pid, argv in _iter_proc_cmdlines():
+        flat = " ".join(argv)
+        if "scheduler.py" in flat and "daemon" in argv:
+            workers = None
+            if "--workers" in argv:
+                try:
+                    workers = int(argv[argv.index("--workers") + 1])
+                except (ValueError, IndexError):
+                    pass
+            daemon = {"pid": pid, "workers": workers, "argv": argv,
+                      **_proc_meta(pid)}
+        if "opencode" not in "\x00".join(argv) or "run" not in argv:
+            continue
+        # only `<...>/opencode run ...` agent processes (skips `opencode serve`, auth, etc.)
+        base = os.path.basename(argv[0]) if argv else ""
+        if "opencode" not in base:
+            continue
+        if "serve" in argv or "web" in argv:
+            continue
+        try:
+            if argv.index("run") != 1:
+                continue
+        except ValueError:
+            continue
+        title = _title_of(argv)
+        if title == "mail-scheduler-agent":
+            mail_procs.append((pid, argv))
+            continue
+        if not title:
+            continue
+        m = TITLE_RE.match(title)
+        if m:
+            job_guess, phase = m.group("job"), (m.group("phase") or "-main").lstrip("-")
+        else:
+            job_guess, phase = title, "main?"
+        # keep only real agent runs (title carried a run timestamp or is mail agent)
+        opencode_procs.append({
+            "pid": pid, "argv": argv, "title": title,
+            "job_guess": job_guess, "phase": phase,
+            **_proc_meta(pid),
+        })
+
+    ps_info = _ps_enrich([p["pid"] for p in opencode_procs])
+    for p in opencode_procs:
+        p.update(ps_info.get(p["pid"], {}))
+
+    by_job = {}
+    for p in opencode_procs:
+        by_job.setdefault(p["job_guess"], []).append(p)
+
+    agents = []
+    matched_pids = set()
+    for r in running_runs:
+        procs = by_job.get(r["job_name"], [])
+        # prefer a main-phase proc; check/report procs belong to the same run window
+        main = [p for p in procs if p["phase"] == "main"] or procs
+        proc = main[0] if main else None
+        if proc:
+            matched_pids.add(proc["pid"])
+        elapsed = max(0.0, now - (r["started_at"] or now))
+        timeout = r["job_timeout"] or 600
+        live_log = r["log_path"] or _resolve_live_log(r["job_name"], r["started_at"])
+        agents.append({
+            "job": r["job_name"], "run_id": r["id"], "phase": "main",
+            "started_at": r["started_at"], "elapsed_s": elapsed,
+            "timeout_s": timeout, "remaining_s": max(0.0, timeout - elapsed),
+            "pid": proc["pid"] if proc else None,
+            "etime": proc.get("etime") if proc else None,
+            "pcpu": proc.get("pcpu") if proc else None,
+            "mem_kb": proc.get("mem_kb") if proc else None,
+            "state": proc.get("state") if proc else None,
+            "session_id": r["session_id"],
+            "log_path": live_log,
+            "dir": r["job_dir"], "agent": r["job_agent"], "model": r["job_model"],
+            "live_proc": proc is not None,
+        })
+        # extra check/report procs for the same job get their own rows
+        for p in procs:
+            if p["pid"] in matched_pids:
+                continue
+            matched_pids.add(p["pid"])
+            agents.append({
+                "job": r["job_name"], "run_id": r["id"], "phase": p["phase"],
+                "started_at": r["started_at"], "elapsed_s": elapsed,
+                "timeout_s": timeout, "remaining_s": max(0.0, timeout - elapsed),
+                "pid": p["pid"], "etime": p.get("etime"), "pcpu": p.get("pcpu"),
+                "mem_kb": p.get("mem_kb"), "state": p.get("state"),
+                "session_id": r["session_id"], "log_path": live_log,
+                "dir": r["job_dir"], "agent": r["job_agent"], "model": r["job_model"],
+                "live_proc": True,
+            })
+
+    orphans = [p for p in opencode_procs if p["pid"] not in matched_pids]
+
+    phases = {"main": 0, "check": 0, "report": 0}
+    for a in agents:
+        phases[a["phase"]] = phases.get(a["phase"], 0) + 1
+    return {
+        "now": now, "daemon": daemon,
+        "agents": sorted(agents, key=lambda a: a["started_at"] or 0),
+        "orphans": orphans,
+        "mail_agents": [{"pid": pid, **_proc_meta(pid)} for pid, _ in mail_procs],
+        "counts": {"total": len(agents), **phases,
+                   "orphan_procs": len(orphans),
+                   "mail_agents": len(mail_procs)},
+        "jobs_total": len(jobs),
+        "jobs_enabled": sum(1 for j in jobs.values() if j["enabled"]),
+        "jobs_running": sum(1 for j in jobs.values() if j["status"] == "running"),
+    }
+
+
+def _fmt_dur(sec):
+    sec = int(max(0, sec or 0))
+    if sec < 90:
+        return f"{sec}s"
+    if sec < 5400:
+        return f"{sec // 60}m{sec % 60:02d}"
+    h, rem = divmod(sec, 3600)
+    if h < 48:
+        return f"{h}h{rem // 60:02d}"
+    return f"{sec // 86400}d{h % 24:02d}h"
+
+
+def format_agents_table(snap, width=0):
+    L = []
+    now = datetime.fromtimestamp(snap["now"]).strftime("%Y-%m-%d %H:%M:%S")
+    d = snap["daemon"]
+    if d:
+        pool = f"workers={d['workers']}" if d.get("workers") else "workers=?"
+        dline = f"daemon pid={d['pid']} {pool}"
+    else:
+        dline = "daemon NOT FOUND (no `scheduler.py daemon` process)"
+    L.append(f"agents deployed: {snap['counts']['total']}  "
+             f"(main={snap['counts'].get('main', 0)} "
+             f"check={snap['counts'].get('check', 0)} "
+             f"report={snap['counts'].get('report', 0)})  "
+             f"| jobs {snap['jobs_running']} running / {snap['jobs_enabled']} enabled / "
+             f"{snap['jobs_total']} total  |  {dline}  |  {now}")
+    if snap["counts"]["orphan_procs"]:
+        L.append(f"! {snap['counts']['orphan_procs']} orphan opencode proc(s) with no DB run "
+                 f"(see bottom)")
+    if snap["counts"]["mail_agents"]:
+        L.append(f"i mail bridge agents: {snap['counts']['mail_agents']} "
+                 f"(pids {', '.join(str(m['pid']) for m in snap['mail_agents'])})")
+    L.append("")
+    if not snap["agents"]:
+        L.append("(no agents deployed — nothing is running)")
+    else:
+        hdr = (f"{'JOB':<18} {'RUN#':>5} {'PHASE':<6} {'ELAPSED':>7} {'LEFT':>7} "
+               f"{'PID':>7} {'CPU%':>6} {'MEM':>7} {'SESSION':<9} {'TASK DETAIL'}")
+        L.append(hdr)
+        L.append("-" * len(hdr))
+        for a in snap["agents"]:
+            sess = (a["session_id"] or "-")[:8]
+            mem = f"{a['mem_kb'] // 1024}M" if a.get("mem_kb") else "-"
+            pid = str(a["pid"]) if a.get("pid") else "no-proc!"
+            detail = a["job"]
+            bits = []
+            if a.get("agent"):
+                bits.append(f"agent={a['agent']}")
+            if a.get("model"):
+                bits.append(str(a["model"]).split("/")[-1][:28])
+            if a.get("dir") and a["dir"] != ".":
+                bits.append(os.path.basename(a["dir"].rstrip("/")) if a["dir"] else "")
+            if bits:
+                detail += "  [" + " ".join(b for b in bits if b) + "]"
+            L.append(f"{a['job']:<18} #{a['run_id']:>4} {a['phase']:<6} "
+                     f"{_fmt_dur(a['elapsed_s']):>7} {_fmt_dur(a['remaining_s']):>7} "
+                     f"{pid:>7} {(a.get('pcpu') or '-'):>6} {mem:>7} {sess:<9} {detail}")
+            L.append(f"  {'started':<18} {datetime.fromtimestamp(a['started_at']).strftime('%m-%d %H:%M:%S') if a['started_at'] else '-':<14} "
+                     f"log={a['log_path'] or '-'}")
+    if snap["orphans"]:
+        L.append("")
+        L.append("orphan opencode procs (no matching DB run — may be manual `opencode run`):")
+        for p in snap["orphans"]:
+            L.append(f"  pid={p['pid']} title={p['title'][:60]}")
+    out = "\n".join(L)
+    if width and width > 0:
+        out = "\n".join(line[:width] for line in out.splitlines())
+    return out
+
+
+def cmd_agents(args):
+    snap = live_agent_snapshot()
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "now": snap["now"], "counts": snap["counts"],
+            "daemon": ({k: v for k, v in (snap["daemon"] or {}).items() if k != "argv"}
+                       if snap["daemon"] else None),
+            "agents": snap["agents"], "orphans": snap["orphans"],
+        }, default=str, indent=2))
+    else:
+        import shutil
+        w = shutil.get_terminal_size((120, 40)).columns
+        print(format_agents_table(snap, width=w))
+
+
+def cmd_top(args):
+    """Live refreshing TUI: how many agents are deployed, on what task."""
+    interval = max(0.5, getattr(args, "interval", 2.0) or 2.0)
+    if getattr(args, "once", False):
+        return cmd_agents(args)
+    import shutil
+    try:
+        while True:
+            snap = live_agent_snapshot()
+            w = shutil.get_terminal_size((120, 40)).columns
+            # ANSI clear + home (no curses dependency; works over ssh/plain tty)
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.write(format_agents_table(snap, width=w))
+            sys.stdout.write(f"\n\nrefresh {interval:g}s — Ctrl+C / q to quit "
+                             f"(`scheduler.py agents` for a one-shot, `--json` for scripts)\n")
+            sys.stdout.flush()
+            # sleep in small slices so Ctrl+C is responsive even with long intervals
+            end = time.time() + interval
+            while time.time() < end:
+                time.sleep(min(0.2, end - time.time()))
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
 def main():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     ensure_schema()
@@ -958,6 +1435,18 @@ def main():
 
     h = sub.add_parser("heal", help="repair stranded run/job records now")
     h.set_defaults(fn=cmd_heal)
+
+    ag = sub.add_parser("agents", help="show deployed agents: count + which task each runs")
+    ag.add_argument("--json", action="store_true", help="machine-readable output")
+    ag.add_argument("--once", action="store_true", help="alias: same as agents (for top --once symmetry)")
+    ag.set_defaults(fn=cmd_agents)
+
+    t = sub.add_parser("top", help="live TUI: agents deployed per task, refreshing")
+    t.add_argument("-n", "--interval", type=float, default=2.0,
+                   help="refresh seconds (default 2)")
+    t.add_argument("--once", action="store_true", help="single snapshot, no refresh")
+    t.add_argument("--json", action="store_true", help="with --once: machine-readable output")
+    t.set_defaults(fn=cmd_top)
 
     args = p.parse_args()
     if args.cmd == "run-now":
